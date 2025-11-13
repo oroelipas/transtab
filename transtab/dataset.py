@@ -3,7 +3,7 @@ import pdb
 
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import LabelEncoder, OrdinalEncoder, MinMaxScaler
+from sklearn.preprocessing import LabelEncoder, OrdinalEncoder, MinMaxScaler, OneHotEncoder
 from sklearn.model_selection import train_test_split
 
 try:
@@ -34,7 +34,7 @@ EXAMPLE_DATACONFIG = {
     }
 }
 
-def load_data(dataname, dataset_config=None, encode_cat=False, data_cut=None, seed=123):
+def load_data(dataname, dataset_config=None, encode_cat=False, data_cut=None, seed=123, verbose=True):
     '''Load datasets from the local device or from openml.datasets.
 
     Parameters
@@ -80,9 +80,11 @@ def load_data(dataname, dataset_config=None, encode_cat=False, data_cut=None, se
 
     '''
     if dataset_config is None: dataset_config = OPENML_DATACONFIG
-    if isinstance(dataname, str):
+    if isinstance(dataname, str) or isinstance(dataname, int) or isinstance(dataname, np.int64):
         # load a single tabular data
-        return load_single_data(dataname=dataname, dataset_config=dataset_config, encode_cat=encode_cat, data_cut=data_cut, seed=seed)
+        dataname = int(dataname) if isinstance(dataname, np.int64) else dataname
+        data_config = dataset_config.get(dataname, None)
+        return load_single_data(dataname=dataname, dataset_config=data_config, encode_cat=encode_cat, data_cut=data_cut, seed=seed, verbose=verbose)
     
     if isinstance(dataname, list):
         # load a list of datasets, combine together and outputs
@@ -92,7 +94,7 @@ def load_data(dataname, dataset_config=None, encode_cat=False, data_cut=None, se
         for dataname_ in dataname:
             data_config = dataset_config.get(dataname_, None)
             allset, trainset, valset, testset, cat_cols, num_cols, bin_cols = \
-                load_single_data(dataname_, dataset_config=data_config, encode_cat=encode_cat, data_cut=data_cut, seed=seed)
+                load_single_data(dataname_, dataset_config=data_config, encode_cat=encode_cat, data_cut=data_cut, seed=seed, verbose=verbose)
             num_col_list.extend(num_cols)
             cat_col_list.extend(cat_cols)
             bin_col_list.extend(bin_cols)
@@ -102,7 +104,7 @@ def load_data(dataname, dataset_config=None, encode_cat=False, data_cut=None, se
             test_list.append(testset)
         return all_list, train_list, val_list, test_list, cat_col_list, num_col_list, bin_col_list
 
-def load_single_data(dataname, dataset_config=None, encode_cat=False, data_cut=None, seed=123):
+def load_single_data(dataname, dataset_config=None, encode_cat=False, data_cut=None, seed=123, verbose=True):
     '''Load tabular dataset from local or from openml public database.
     args:
         dataname: Can either be the data directory on `./data/{dataname}` or the dataname which can be found from the openml database.
@@ -116,8 +118,7 @@ def load_single_data(dataname, dataset_config=None, encode_cat=False, data_cut=N
         trainset, valset, testset: the train/val/test split
         num_cols, cat_cols, bin_cols: the list of numerical/categorical/binary column names
     '''
-    print('####'*10)
-    if os.path.exists(dataname):
+    if not isinstance(dataname, int) and os.path.exists(dataname):
         print(f'load from local data dir {dataname}')
         filename = os.path.join(dataname, 'data_processed.csv')
         df = pd.read_csv(filename, index_col=0)
@@ -164,13 +165,14 @@ def load_single_data(dataname, dataset_config=None, encode_cat=False, data_cut=N
         X,y,categorical_indicator, attribute_names = dataset.get_data(dataset_format='dataframe', target=dataset.default_target_attribute)
         
         if isinstance(dataname, int):
-            openml_list = openml.datasets.list_datasets(output_format="dataframe")  # returns a dict
-            dataname = openml_list.loc[openml_list.did == dataname].name.values[0]
+            dataname = dataset.name
         else:
             openml_list = openml.datasets.list_datasets(output_format="dataframe")  # returns a dict
-            print(f'openml data index: {openml_list.loc[openml_list.name == dataname].index[0]}')
-        
-        print(f'load data from {dataname}')
+            if verbose:
+                print(f'openml data index: {openml_list.loc[openml_list.name == dataname].index[0]}')
+
+        if hasattr(X, "sparse"):
+            X = X.sparse.to_dense()
 
         # drop cols which only have one unique value
         drop_cols = [col for col in attribute_names if X[col].nunique()<=1]
@@ -181,9 +183,15 @@ def load_single_data(dataname, dataset_config=None, encode_cat=False, data_cut=N
         num_cols = [col for col in all_cols[~categorical_indicator] if col not in drop_cols]
         all_cols = [col for col in all_cols if col not in drop_cols]
         
-        if dataset_config is not None:
-            if 'bin' in dataset_config: bin_cols = [c for c in cat_cols if c in dataset_config['bin']]
-        else: bin_cols = []
+        if dataset_config is not None and 'bin' in dataset_config:
+            bin_cols = [c for c in cat_cols if c in dataset_config['bin']]
+        else: 
+            bin_cols = [c for c in cat_cols if (X[c].dropna().nunique() <= 2) and (X[c].dropna().str.lower().isin(['yes', 'no', 'true', 'false', 't', 'f', 'm', 1, 0])).all()]
+            # NEWBIN: Con esto hemos reducido la cantidad de tokens del dataset dna de ~220 a ~130 y  de PhishingWebsites de ~57 a ~50	
+            #for c in cat_cols:
+            #    X[c] = X[c].cat.remove_unused_categories()
+            # Contamos como binaria cualquier categorica que tenga 2 valores
+            #bin_cols = [c for c in cat_cols if (X[c].dropna().nunique() <= 2)]
         cat_cols = [c for c in cat_cols if c not in bin_cols]
 
         # encode target label
@@ -193,23 +201,34 @@ def load_single_data(dataname, dataset_config=None, encode_cat=False, data_cut=N
     # start processing features
     # process num
     if len(num_cols) > 0:
-        for col in num_cols: X[col].fillna(X[col].mode()[0], inplace=True)
+        for col in num_cols: 
+            X[col] = X[col].fillna(X[col].mode()[0])
         X[num_cols] = MinMaxScaler().fit_transform(X[num_cols])
 
     if len(cat_cols) > 0:
-        for col in cat_cols: X[col].fillna(X[col].mode()[0], inplace=True)
+        for col in cat_cols: 
+            X[col] = X[col].fillna(X[col].mode()[0])
+            X[col] = pd.Categorical(X[col]).codes
+            X[col] = X[col].astype('category')
         # process cate
-        if encode_cat:
+        if encode_cat == "ordinal":
             X[cat_cols] = OrdinalEncoder().fit_transform(X[cat_cols])
-        else:
-            X[cat_cols] = X[cat_cols].astype(str)
+        elif encode_cat == "onehot":
+            X[cat_cols] = OneHotEncoder(sparse_output=False).fit_transform(X[cat_cols])
+
 
     if len(bin_cols) > 0:
-        for col in bin_cols: X[col].fillna(X[col].mode()[0], inplace=True)
-        if 'binary_indicator' in dataset_config:
-            X[bin_cols] = X[bin_cols].astype(str).applymap(lambda x: 1 if x.lower() in dataset_config['binary_indicator'] else 0).values
+        for col in bin_cols: 
+            # Se rellena los vacios con la moda
+            X[col] = X[col].fillna(X[col].mode()[0])
+        if dataset_config is not None and 'binary_indicator' in dataset_config:
+            X[bin_cols] = X[bin_cols].astype(str).apply(lambda col: col.map(lambda x: 1 if x.lower() in dataset_config['binary_indicator'] else 0)).values
         else:
-            X[bin_cols] = X[bin_cols].astype(str).applymap(lambda x: 1 if x.lower() in ['yes','true','1','t'] else 0).values        
+            X[bin_cols] = X[bin_cols].astype(str).apply(lambda col: col.map(lambda x: 1 if x.lower() in ['yes', 'true', '1', 't', 'm'] else 0)).values
+            # Si no se especifica, el primer valor de la columna binaria se toma como el valor positivo
+            #for col in bin_cols:
+            #    pos_val = X[col].mode().values[0]
+            #    X[col] = X[col].astype(str).apply(lambda x: 1 if x == pos_val else 0)
         
         # if no dataset_config given, keep its original format
         # raise warning if there is not only 0/1 in the binary columns
@@ -270,6 +289,9 @@ def load_single_data(dataname, dataset_config=None, encode_cat=False, data_cut=N
         train_dataset = train_dataset.iloc[:-val_size]
         y_train = y_train[:-val_size]
 
+    cat_cols = [str(c) for c in cat_cols] # np.str_ to str
+    num_cols = [str(c) for c in num_cols]
+    bin_cols = [str(c) for c in bin_cols]
     if data_cut is not None:
         np.random.shuffle(all_cols)
         sp_size=int(len(all_cols)/data_cut)
@@ -291,9 +313,11 @@ def load_single_data(dataname, dataset_config=None, encode_cat=False, data_cut=N
             train_subset_list.append(
                 (trainset_splits[i][new_col_splits[i]], y_train.loc[trainset_splits[i].index])
             )
-        print('# data: {}, # feat: {}, # cate: {},  # bin: {}, # numerical: {}, pos rate: {:.2f}'.format(len(X), len(attribute_names), len(cat_cols), len(bin_cols), len(num_cols), (y==1).sum()/len(y)))
+        if verbose:
+            print('# data: {}, #num_classes: {}, # feat: {}, # cate: {},  # bin: {}, # numerical: {}, pos rate: {:.2f}'.format(len(X), len(y.unique()), len(attribute_names), len(cat_cols), len(bin_cols), len(num_cols), (y==1).sum()/len(y)))
         return (X, y), train_subset_list, (val_dataset,y_val), (test_dataset, y_test), cat_cols, num_cols, bin_cols
 
     else:
-        print('# data: {}, # feat: {}, # cate: {},  # bin: {}, # numerical: {}, pos rate: {:.2f}'.format(len(X), len(attribute_names), len(cat_cols), len(bin_cols), len(num_cols), (y==1).sum()/len(y)))
+        if verbose:
+            print('# data: {}, #num_classes: {}, # feat: {}, # cate: {},  # bin: {}, # numerical: {}, pos rate: {:.2f}'.format(len(X), len(y.unique()), len(attribute_names), len(cat_cols), len(bin_cols), len(num_cols), (y==1).sum()/len(y)))
         return (X,y), (train_dataset,y_train), (val_dataset,y_val), (test_dataset, y_test), cat_cols, num_cols, bin_cols

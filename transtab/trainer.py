@@ -10,6 +10,7 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import pandas as pd
 from tqdm.autonotebook import trange
+import matplotlib.pyplot as plt
 
 from transtab import constants
 from transtab.evaluator import predict, get_eval_metric_fn, EarlyStopping
@@ -42,6 +43,7 @@ class Trainer:
         eval_metric='auc',
         eval_less_is_better=False,
         num_workers=0,
+        verbose=False,
         **kwargs,
         ):
         '''args:
@@ -97,6 +99,7 @@ class Trainer:
         self.lr_scheduler = None
         self.balance_sample = balance_sample
         self.load_best_at_last = load_best_at_last
+        self.verbose = verbose
 
     def train(self):
         args = self.args
@@ -107,6 +110,9 @@ class Trainer:
             self.create_scheduler(num_train_steps, self.optimizer)
 
         start_time = time.time()
+        epoch_losses = {"epoch":[], "train_loss": []}
+        if self.test_set_list is not None:
+            epoch_losses['val_loss'] = []
         for epoch in trange(args['num_epoch'], desc='Epoch'):
             ite = 0
             train_loss_all = 0
@@ -121,16 +127,26 @@ class Trainer:
                     if self.lr_scheduler is not None:
                         self.lr_scheduler.step()
 
+            avg_loss = train_loss_all / max(ite, 1)
+            epoch_losses['epoch'].append(epoch)
+            epoch_losses['train_loss'].append(avg_loss)
+
             if self.test_set_list is not None:
                 eval_res_list = self.evaluate()
                 eval_res = np.mean(eval_res_list)
-                print('epoch: {}, test {}: {:.6f}'.format(epoch, self.args['eval_metric_name'], eval_res))
+                epoch_losses['val_loss'].append(eval_res)
+                if self.verbose:
+                    print('epoch: {}, test {}: {:.6f}'.format(epoch, self.args['eval_metric_name'], eval_res))
                 self.early_stopping(-eval_res, self.model)
                 if self.early_stopping.early_stop:
-                    print('early stopped')
+                    if self.verbose:
+                        print('early stopped')
                     break
-            print('epoch: {}, train loss: {:.4f}, lr: {:.6f}, spent: {:.1f} secs'.format(epoch, train_loss_all, self.optimizer.param_groups[0]['lr'], time.time()-start_time))
-
+            if self.verbose:
+                print('epoch: {}, train loss: {:.4f}, lr: {:.6f}, spent: {:.1f} secs'.format(epoch, avg_loss, self.optimizer.param_groups[0]['lr'], time.time()-start_time))
+        
+        if self.test_set_list is not None:
+            self.early_stopping.save_checkpoint(-eval_res, self.model)
         if os.path.exists(self.output_dir):
             if self.test_set_list is not None:
                 # load checkpoints
@@ -138,6 +154,7 @@ class Trainer:
                 state_dict = torch.load(os.path.join(self.output_dir, constants.WEIGHTS_NAME), map_location='cpu')
                 self.model.load_state_dict(state_dict)
             self.save_model(self.output_dir)
+            self.save_training_curve(epoch_losses)
 
         logger.info('training complete, cost {:.1f} secs.'.format(time.time()-start_time))
 
@@ -188,6 +205,7 @@ class Trainer:
             print('set warmup training.')
             self.create_scheduler(args['num_training_steps'], self.optimizer)
 
+        epoch_losses = {"epoch":[], "train_loss": [], "val_loss": []}
         for epoch in range(args['num_epoch']):
             ite = 0
             # go through all train sets
@@ -217,19 +235,26 @@ class Trainer:
                     if self.lr_scheduler is not None:
                         self.lr_scheduler.step()
 
+            avg_loss = train_loss_all / max(ite, 1)
+            epoch_losses['epoch'].append(epoch)
+            epoch_losses['train_loss'].append(avg_loss)
+
             if self.test_set is not None:
                 # evaluate in each epoch
                 self.model.eval()
                 x_test, y_test = self.test_set
                 pred_all = predict(self.model, x_test, self.args['eval_batch_size'])
                 eval_res = self.args['eval_metric'](y_test, pred_all)
-                print('epoch: {}, test {}: {}'.format(epoch, self.args['eval_metric_name'], eval_res))
+                epoch_losses['val_loss'].append(eval_res)
+                if self.verbose:
+                    print('epoch: {}, test {}: {}'.format(epoch, self.args['eval_metric_name'], eval_res))
                 self.early_stopping(-eval_res, self.model)
                 if self.early_stopping.early_stop:
-                    print('early stopped')
+                    if self.verbose:
+                        print('early stopped')
                     break
-
-            print('epoch: {}, train loss: {}, lr: {:.6f}'.format(epoch, train_loss_all, self.optimizer.param_groups[0]['lr']))
+            if self.verbose:
+                print('epoch: {}, train loss: {}, lr: {:.6f}'.format(epoch, train_loss_all, self.optimizer.param_groups[0]['lr']))
 
         if os.path.exists(self.output_dir):
             if self.test_set is not None:
@@ -238,6 +263,7 @@ class Trainer:
                 state_dict = torch.load(os.path.join(self.output_dir, constants.WEIGHTS_NAME), map_location='cpu')
                 self.model.load_state_dict(state_dict)
             self.save_model(self.output_dir)
+            self.save_training_curve(epoch_losses)
 
     def save_model(self, output_dir=None):
         if output_dir is None:
@@ -314,3 +340,26 @@ class Trainer:
             drop_last=False,
             )
         return trainloader
+
+    def save_training_curve(self, epoch_losses):
+        # Save losses to CSV
+        loss_csv_path = os.path.join(self.output_dir, "train_loss.csv")
+        pd.DataFrame(epoch_losses).to_csv(loss_csv_path, index=False)
+
+        # Save loss plot
+        plt.figure()
+        plt.plot(epoch_losses["epoch"], epoch_losses["train_loss"], marker='o', label='Train', color='blue')
+        if self.test_set_list is not None:
+            plt.plot(epoch_losses["epoch"], epoch_losses["val_loss"], marker='o', label='Val', color='orange')
+            # draw vertical line at the point of early stopping
+            min_val_loss_index = np.argmin(epoch_losses["val_loss"])
+            plt.axvline(x=min_val_loss_index, color='red', linestyle='--', label='Early Stopping Point')
+        plt.xlabel('Epoch')
+        plt.ylabel('Train Loss')
+        plt.title('Loss per Epoch')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        loss_img_path = os.path.join(self.output_dir, "loss.png")
+        plt.savefig(loss_img_path)
+        plt.close()

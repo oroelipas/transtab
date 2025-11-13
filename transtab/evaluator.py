@@ -12,7 +12,7 @@ def predict(clf,
     x_test,
     y_test=None,
     return_loss=False,
-    eval_batch_size=256,
+    eval_batch_size=256, # Quizas esto en NGPU sea poquisimo, podríamos aumentarlo?
     ):
     '''Make predictions by TransTabClassifier.
 
@@ -103,6 +103,7 @@ def get_eval_metric_fn(eval_metric):
         'acc': acc_fn,
         'auc': auc_fn,
         'mse': mse_fn,
+        'bin_acc': bin_acc,
         'val_loss': None,
     }
     return fn_dict[eval_metric]
@@ -116,6 +117,10 @@ def auc_fn(y, p):
 
 def mse_fn(y, p):
     return mean_squared_error(y, p)
+
+def bin_acc(y, p):
+    y_p = np.where(p > 0.5, 1, 0)
+    return accuracy_score(y, y_p)
 
 class EarlyStopping:
     """Early stops the training if validation loss doesn't improve after a given patience."""
@@ -156,7 +161,7 @@ class EarlyStopping:
             score = -val_loss
         if self.best_score is None:
             self.best_score = score
-            self.save_checkpoint(val_loss, model)
+            #self.save_checkpoint(val_loss, model)#########
         elif score < self.best_score + self.delta:
             self.counter += 1
             self.trace_func(f'EarlyStopping counter: {self.counter} out of {self.patience}')
@@ -164,7 +169,7 @@ class EarlyStopping:
                 self.early_stop = True
         else:
             self.best_score = score
-            self.save_checkpoint(val_loss, model)
+            #self.save_checkpoint(val_loss, model)##########
             self.counter = 0
 
     def save_checkpoint(self, val_loss, model):

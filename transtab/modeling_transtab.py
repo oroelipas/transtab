@@ -18,6 +18,13 @@ from transtab import constants
 import logging
 logger = logging.getLogger(__name__)
 
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message="Converting mask without torch.bool dtype to bool; this will negatively affect performance."
+)
+
 class TransTabWordEmbedding(nn.Module):
     r'''
     Encode tokens drawn from column names, categorical and binary features.
@@ -30,6 +37,7 @@ class TransTabWordEmbedding(nn.Module):
         layer_norm_eps=1e-5,
         ) -> None:
         super().__init__()
+        # Se inicializa el diccionario de embeddings con pesos aleatorios
         self.word_embeddings = nn.Embedding(vocab_size, hidden_dim, padding_idx)
         nn_init.kaiming_normal_(self.word_embeddings.weight)
         self.norm = nn.LayerNorm(hidden_dim, eps=layer_norm_eps)
@@ -44,6 +52,8 @@ class TransTabWordEmbedding(nn.Module):
 class TransTabNumEmbedding(nn.Module):
     r'''
     Encode tokens drawn from column names and the corresponding numerical features.
+    Realiza la multiplicación de:
+    feature_embeding = learnable_column_embeding * value + bias
     '''
     def __init__(self, hidden_dim) -> None:
         super().__init__()
@@ -56,13 +66,16 @@ class TransTabNumEmbedding(nn.Module):
         num_col_emb: numerical column embedding, (# numerical columns, emb_dim)
         x_num_ts: numerical features, (bs, emb_dim)
         num_mask: the mask for NaN numerical features, (bs, # numerical columns)
+        Multiplica el embedding de la columna por el valor de la celda y le suma un bias learnable.
         '''
+        # repite el embedding de la columna para cada fila del batch
         num_col_emb = num_col_emb.unsqueeze(0).expand((x_num_ts.shape[0],-1,-1))
         num_feat_emb = num_col_emb * x_num_ts.unsqueeze(-1).float() + self.num_bias
         return num_feat_emb
 
 class TransTabFeatureExtractor:
     r'''
+    Usa el tokenizer de BERT con su vocabulario, pero no el modelo de BERT.
     Process input dataframe to input indices towards transtab encoder,
     usually used to build dataloader for paralleling loading.
     '''
@@ -100,11 +113,11 @@ class TransTabFeatureExtractor:
         self.ignore_duplicate_cols = ignore_duplicate_cols
 
         if categorical_columns is not None:
-            self.categorical_columns = list(set(categorical_columns))
+            self.categorical_columns = [str(x) for x in list(set(categorical_columns))]
         if numerical_columns is not None:
-            self.numerical_columns = list(set(numerical_columns))
+            self.numerical_columns = [str(x) for x in list(set(numerical_columns))]
         if binary_columns is not None:
-            self.binary_columns = list(set(binary_columns))
+            self.binary_columns = [str(x) for x in list(set(binary_columns))]
 
         # check if column exists overlap
         col_no_overlap, duplicate_cols = self._check_column_overlap(self.categorical_columns, self.numerical_columns, self.binary_columns)
@@ -128,10 +141,12 @@ class TransTabFeatureExtractor:
         Returns
         -------
         encoded_inputs: a dict with {
-                'x_num': tensor contains numerical features,
-                'num_col_input_ids': tensor contains numerical column tokenized ids,
-                'x_cat_input_ids': tensor contains categorical column + feature ids,
-                'x_bin_input_ids': tesnor contains binary column + feature ids,
+                'x_num': tensor contains numerical features: (# samples, # numerical_columns),
+                'num_col_input_ids': tensor contains numerical column tokenized ids: (# numerical_columns, # max_num_tokens). Contiene los ids de los tokens que componen los nombres de las columnas numericas.
+                'x_cat_input_ids': tensor contains categorical column + feature ids: Son los ids de los tokens de nombre de columnas y su valor: Ej: "CIUDAD GRANADA PAIS ESPAÑA OCUPACION ACTUAL ESTUDIANTE...". Una fila por cada ejemplo
+                                    LOL entonces las categoricas se codifican asi con una secuencia? No era que se unian el valor del embeding de la columna con el del valor de la celda?
+                                    PERO SI FUERA UNA SECUENCIA DEBERÍA DE TENER POSITIONAL ENCODING NO?
+                'x_bin_input_ids': tensor contains binary column + feature ids,
             }
         '''
         encoded_inputs = {
@@ -159,7 +174,7 @@ class TransTabFeatureExtractor:
         if len(num_cols) > 0:
             x_num = x[num_cols]
             x_num = x_num.fillna(0) # fill Nan with zero
-            x_num_ts = torch.tensor(x_num.values, dtype=float)
+            x_num_ts = torch.tensor(x_num.values.copy(), dtype=float)
             num_col_ts = self.tokenizer(num_cols, padding=True, truncation=True, add_special_tokens=False, return_tensors='pt')
             encoded_inputs['x_num'] = x_num_ts
             encoded_inputs['num_col_input_ids'] = num_col_ts['input_ids']
@@ -227,15 +242,15 @@ class TransTabFeatureExtractor:
         '''update cat/num/bin column maps.
         '''
         if cat is not None:
-            self.categorical_columns.extend(cat)
+            self.categorical_columns.extend([str(x) for x in cat])
             self.categorical_columns = list(set(self.categorical_columns))
 
         if num is not None:
-            self.numerical_columns.extend(num)
+            self.numerical_columns.extend(str(x) for x in num)
             self.numerical_columns = list(set(self.numerical_columns))
 
         if bin is not None:
-            self.binary_columns.extend(bin)
+            self.binary_columns.extend(str(x) for x in bin)
             self.binary_columns = list(set(self.binary_columns))
 
         col_no_overlap, duplicate_cols = self._check_column_overlap(self.categorical_columns, self.numerical_columns, self.binary_columns)
@@ -275,6 +290,7 @@ class TransTabFeatureExtractor:
 class TransTabFeatureProcessor(nn.Module):
     r'''
     Process inputs from feature extractor to map them to embeddings.
+    Su input es tal cual el output del FeatureExtractor
     '''
     def __init__(self,
         vocab_size=None,
@@ -290,17 +306,24 @@ class TransTabFeatureProcessor(nn.Module):
             (yes,no); (true,false); (0,1).
         '''
         super().__init__()
+        # Esto sirve para crear un embeding aprendible para cada index de los tokens
+        # vocab_size es el tamaño del vocabulario de BERT: 30522
         self.word_embedding = TransTabWordEmbedding(
             vocab_size=vocab_size,
             hidden_dim=hidden_dim,
             hidden_dropout_prob=hidden_dropout_prob,
             padding_idx=pad_token_id
             )
+        # TransTabNumEmbedding realiza la multiplicación value * column_embedding + bias
         self.num_embedding = TransTabNumEmbedding(hidden_dim)
         self.align_layer = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.device = device
 
     def _avg_embedding_by_mask(self, embs, att_mask=None):
+        """
+        Reduce una lista de embedding con la media
+        Sirve para representar con un solo embedding las cadenas de tokens que componen el nombre de una columna numerica
+        """
         if att_mask is None:
             return embs.mean(1)
         else:
@@ -328,20 +351,32 @@ class TransTabFeatureProcessor(nn.Module):
         bin_feat_embedding = None
 
         if x_num is not None and num_col_input_ids is not None:
-            num_col_emb = self.word_embedding(num_col_input_ids.to(self.device)) # number of cat col, num of tokens, embdding size
+            # num_col_input_ids: Tokens de los nombres de las columnas numericas: #num_col, max_num_tokens
+            num_col_emb = self.word_embedding(num_col_input_ids.to(self.device))
             x_num = x_num.to(self.device)
+            # Si el nombre de una columna tiene varios tokens el embedding se hace la media de los embeddings de los tokens
+            # num_col_emb before: #num_cols, #max_num_tokens, emb_dim
             num_col_emb = self._avg_embedding_by_mask(num_col_emb, num_att_mask)
+            # num_col_emb after: #num_cols, emb_dim
+            # Multiplicamos el embeding de la columna por el valor de cada una de las celdas de los ejemplos.
             num_feat_embedding = self.num_embedding(num_col_emb, x_num)
             num_feat_embedding = self.align_layer(num_feat_embedding)
+            # num_feat_embedding: batch_size, #num_cols, emb_dim
 
         if x_cat_input_ids is not None:
+            # x_cat_input_ids: batch_size, (tokens_v1 + value_v1 + tokens_v2 + value_v2...)
             cat_feat_embedding = self.word_embedding(x_cat_input_ids.to(self.device))
             cat_feat_embedding = self.align_layer(cat_feat_embedding)
+            # cat_feat_embedding: batch_size, (tokens_v1 + value_v1 + tokens_v2 + value_v2...), emb_dim
 
         if x_bin_input_ids is not None:
+            # x_bin_input_ids: batch_size, (tokens de las variables que son true; el resto con valor 0)
             if x_bin_input_ids.shape[1] == 0: # all false, pad zero
                 x_bin_input_ids = torch.zeros(x_bin_input_ids.shape[0],dtype=int)[:,None]
             bin_feat_embedding = self.word_embedding(x_bin_input_ids.to(self.device))
+            # bin_feat_embedding: batch_size, (tokens de las variables que son true; el resto con valor 0), emb_dim
+            # TODO: Por que no se hace la media de los tokens del nombre de la variable como si se hace en las numericas?
+            # Si hay una variable con 3 tokens (Ej: "own", "_",  "telephone") entonces acaba añadiendose 3 embedings diferentes a la secuencia. ESTO ES INEFICIENTE!
             bin_feat_embedding = self.align_layer(bin_feat_embedding)
 
         # concat all embeddings
@@ -410,9 +445,9 @@ class TransTabTransformerLayer(nn.Module):
                   attn_mask: Optional[Tensor], key_padding_mask: Optional[Tensor]) -> Tensor:
         src = x
         key_padding_mask = ~key_padding_mask.bool()
-        x = self.self_attn(x, x, x,
+        x = self.self_attn(x, x, x, # query, key, value. Internamente se multiplican por los pesos: Q = x @ W_Q,  K = x @ W_K,   V = x @ W_V
                            attn_mask=attn_mask,
-                           key_padding_mask=key_padding_mask,
+                           key_padding_mask=key_padding_mask, # ESTA es la mascara que tiene que ser bool y da el warning!!!
                            )[0]
         return self.dropout1(x)
 
@@ -458,7 +493,8 @@ class TransTabTransformerLayer(nn.Module):
 class TransTabInputEncoder(nn.Module):
     '''
     Build a feature encoder that maps inputs tabular samples to embeddings.
-    
+    TransTabInputEncoder = TransTabFeatureExtractor + TransTabFeatureProcessor 
+    El FeatureExtractor extrae los tokens ids y el FeatureProcessor los convierte en embeddings.
     Parameters:
     -----------
     categorical_columns: list 
@@ -588,6 +624,7 @@ class TransTabLinearClassifier(nn.Module):
         x = x[:,0,:] # take the cls token embedding
         x = self.norm(x)
         logits = self.fc(x)
+        # Devuelve logits, que no tienen un rango concreto, luego hay que aplicarle sigmoide o softmax
         return logits
     
 class TransTabLinearRegressor(nn.Module):
@@ -700,11 +737,11 @@ class TransTabModel(nn.Module):
         self.numerical_columns=numerical_columns
         self.binary_columns=binary_columns
         if categorical_columns is not None:
-            self.categorical_columns = list(set(categorical_columns))
+            self.categorical_columns = [str(x) for x in list(set(categorical_columns))]
         if numerical_columns is not None:
-            self.numerical_columns = list(set(numerical_columns))
+            self.numerical_columns = [str(x) for x in list(set(numerical_columns))]
         if binary_columns is not None:
-            self.binary_columns = list(set(binary_columns))
+            self.binary_columns = [str(x) for x in list(set(binary_columns))]
 
         if feature_extractor is None:
             feature_extractor = TransTabFeatureExtractor(
@@ -721,7 +758,7 @@ class TransTabModel(nn.Module):
             hidden_dropout_prob=hidden_dropout_prob,
             device=device,
             )
-        
+        # TransTabInputEncoder = TransTabFeatureExtractor (saca los tokens) + TransTabFeatureProcessor (convierte los tokens en embeddings)
         self.input_encoder = TransTabInputEncoder(
             feature_extractor=feature_extractor,
             feature_processor=feature_processor,
@@ -759,6 +796,16 @@ class TransTabModel(nn.Module):
 
         '''
         embeded = self.input_encoder(x)
+
+        # TODO: revisar si esto afecta
+        # EN UN TRANSFORMER UNA VEZ SE HA PUESTO EL POSITIONAL ENCODING DEBERIA SER INVARIANTE AL ORDEN DE LOS ELEMENTOS DE LA SECUENCIA
+        # EFECTIVAMENTE SI LO HACEMOS LA ACCURACY NO CAMBIA
+        #print("SHUFFLEANDO LOS TOKENS EN TRANSTABMODEL")
+        #indices = torch.randperm(embeded['embedding'].shape[1]).to(self.device)  # shuffle the tokens
+        #embeded['embedding'] = embeded['embedding'].index_select(1, indices)  # Shuffle the tokens
+        #embeded['attention_mask'] = embeded['attention_mask'].index_select(1, indices)  # Shuffle the tokens
+
+        # add cls token to the beginning of each sequence
         embeded = self.cls_token(**embeded)
 
         # go through transformers, get final cls embedding
@@ -966,8 +1013,12 @@ class TransTabClassifier(TransTabModel):
         self.num_class = num_class
         self.clf = TransTabLinearClassifier(num_class=num_class, hidden_dim=hidden_dim)
         if self.num_class > 2:
+            # CrossEntropyLoss expects pred as logits, target as class index
+            # it performs softmax internally
             self.loss_fn = nn.CrossEntropyLoss(reduction='none')
         else:
+            # Combines a Sigmoid layer and the BCELoss in one single class
+            # it performs sigmoid internally
             self.loss_fn = nn.BCEWithLogitsLoss(reduction='none')
         self.to(device)
 
@@ -1013,6 +1064,7 @@ class TransTabClassifier(TransTabModel):
         if y is not None:
             # compute classification loss
             if self.num_class == 2:
+                # CrossEntropyLoss expects pred as logits, target as class index
                 y_ts = torch.tensor(y.values).to(self.device).float()
                 loss = self.loss_fn(logits.flatten(), y_ts)
             else:
@@ -1287,9 +1339,16 @@ class TransTabForCL(TransTabModel):
         feat_x_list = []
         if isinstance(x, pd.DataFrame):
             sub_x_list = self._build_positive_pairs(x, self.num_partition)
+            #sub_x_list = self._build_positive_pairs_random(x, self.num_partition)
             for sub_x in sub_x_list:
                 # encode two subset feature samples
                 feat_x = self.input_encoder(sub_x)
+                # TODO: revisar si esto afecta
+                #print("feat_x['embedding'].shape:", feat_x['embedding'].shape)
+                #print("SHUFFLEANDO LOS TOKENS EN TRANSTABFORCL-DF")
+                #indices = torch.randperm(feat_x['embedding'].shape[1]).to(self.device)  # shuffle the tokens
+                #feat_x['embedding'] = feat_x['embedding'].index_select(1, indices)  # Shuffle the tokens
+                #feat_x['attention_mask'] = feat_x['attention_mask'].index_select(1, indices)  # Shuffle the tokens
                 feat_x = self.cls_token(**feat_x)
                 feat_x = self.encoder(**feat_x)
                 feat_x_proj = feat_x[:,0,:] # take cls embedding
@@ -1299,6 +1358,12 @@ class TransTabForCL(TransTabModel):
             # pretokenized inputs
             for input_x in x['input_sub_x']:
                 feat_x = self.input_encoder.feature_processor(**input_x)
+                # TODO: revisar si esto afecta
+                #print("feat_x['embedding'].shape:", feat_x['embedding'].shape)
+                #print("SHUFFLEANDO LOS TOKENS EN TRANSTABFORCL-DIC")
+                #indices = torch.randperm(feat_x['embedding'].shape[1]).to(self.device)  # shuffle the tokens
+                #feat_x['embedding'] = feat_x['embedding'].index_select(1, indices)  # Shuffle the tokens
+                #feat_x['attention_mask'] = feat_x['attention_mask'].index_select(1, indices)  # Shuffle the tokens
                 feat_x = self.cls_token(**feat_x)
                 feat_x = self.encoder(**feat_x)
                 feat_x_proj = feat_x[:, 0, :]
@@ -1319,7 +1384,16 @@ class TransTabForCL(TransTabModel):
         return None, loss
 
     def _build_positive_pairs(self, x, n):
+        """
+        return a list of positive pairs 
+        x: dataframe
+        n: number of partitions to be made
+        return a list of dataframes, each is a view
+        """
         x_cols = x.columns.tolist()
+        # TODO: no está haciendo una selección aleatoria de columnas, sino que las está dividiendo en partes iguales
+        # creo que debería hacer crops de tamaño aleatorio entre el 20% y el 80% de las columnas, y luego hacer un shuffle de las columnas
+        # si hacemos eso el oberlap no sería necesario de forma explicita, no??
         sub_col_list = np.array_split(np.array(x_cols), n)
         len_cols = len(sub_col_list[0])
         overlap = int(np.ceil(len_cols * (self.overlap_ratio)))
@@ -1332,6 +1406,26 @@ class TransTabForCL(TransTabModel):
             sub_x = x.copy()[sub_col]
             sub_x_list.append(sub_x)
         return sub_x_list
+
+    def _build_positive_pairs_random(self, x, l=0.2, u=0.8):
+        """
+        return a list of positive pairs 
+        x: dataframe
+        l: lower bound of the random crop size
+        u: upper bound of the random crop size
+        return a list of dataframes, each is a view
+        """
+        x_cols = x.columns.tolist()
+        sub_x_list = []
+        for i in range(self.num_partition):
+            # random crop size between l and u
+            crop_size = np.random.randint(int(len(x_cols)*l), int(len(x_cols)*u))
+            # random sample columns from x
+            sub_col = np.random.choice(x_cols, size=crop_size, replace=False)
+            sub_x = x.copy()[sub_col]
+            sub_x_list.append(sub_x)
+        return sub_x_list
+
 
     def cos_sim(self, a, b):
         if not isinstance(a, torch.Tensor):
