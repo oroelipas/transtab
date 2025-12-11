@@ -131,6 +131,7 @@ dmypy.json
 # checkpoint
 /ckpt
 /checkpoint
+/checkpoints
 
 # MAC
 .DS_Store
